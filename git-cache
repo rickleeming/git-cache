@@ -1,0 +1,354 @@
+#!/usr/bin/python
+
+import ConfigParser
+import contextlib
+import errno
+import fcntl
+import os
+import pwd
+import shlex
+import select
+import socket
+import subprocess
+import sys
+import time
+import urllib
+
+PROGRAM = "git-cache"
+LOG_DELAY = 5
+
+def main(args):
+    global quiet
+
+    try:
+        if len(args) == 2 and args[0] == "-c":
+            proxy(shlex.split(args[1]))
+        elif args in [[], ["help"]]:
+            show_help()
+        elif args == ["init"]:
+            init()
+        elif args == ["update"]:
+            update_all_repos()
+        elif args == ["update", "-q"]:
+            quiet = True
+            update_all_repos()
+        else:
+            log.write("{program}: caching git proxy\n\n"
+                      "Usage: {program} -c 'git-upload-pack REPOSITORY'\n"
+                      "       {program} -c 'git-upload-archive REPOSITORY'\n"
+                      "       {program} help\n"
+                      "       {program} init\n"
+                      "       {program} update [-q]\n".format(program=PROGRAM))
+            sys.exit(1)
+    except Error as e:
+        log.log(e)
+        sys.exit(1)
+
+def proxy(args):
+    if len(args) == 2 and args[0] in ["git-upload-pack", "git-upload-archive"]:
+        upload_pack_or_archive(*args)
+    elif len(args) == 2 and args[0] == "git-receive-pack":
+        raise Error("Pushing via this cache is not supported.")
+    else:
+        raise Error("Unknown command '{}'.".format(" ".join(args)))
+
+def upload_pack_or_archive(command, name):
+    config.read()
+    repo = Repo(name)
+
+    # Only show log output when update is taking a long time or fails.
+    with log.suppress():
+        repo.update(gc=False)
+
+    exec_git([command, repo.local_dir])
+
+def update_all_repos():
+    config.read()
+    lock_file = os.path.join(config.cache_dir, "update-lock")
+    locked_message = "Another instance is running."
+    failed = False
+
+    with lock(lock_file, locked_message, block=False):
+        for quoted_name in sorted(os.listdir(config.repos_dir)):
+            try:
+                repo = Repo(urllib.unquote(quoted_name))
+                repo.update(gc=True)
+            except Error as e:
+                log.log(e)
+                failed = True
+
+    if failed:
+        raise Error("Failed to update one or more repositories.")
+
+def init():
+    # Create config file if it doesn't exist.
+    config.create()
+
+    # Create ~/.ssh/authorized_keys if it doesn't exist.
+    ssh_dir = os.path.expanduser("~/.ssh")
+    authorized_keys_file = os.path.join(ssh_dir, "authorized_keys")
+
+    mkdir(ssh_dir, 0700)
+    os.close(os.open(authorized_keys_file, os.O_WRONLY | os.O_CREAT, 0600))
+
+    # Configure git. Run garbage collection more often to increase the speed
+    # of the cache. Prune unreachable objects immediately to avoid "too many
+    # unreachable objects" warnings during garbage collection.
+    git(["config", "--global", "gc.auto", "500"])
+    git(["config", "--global", "gc.autopacklimit", "500"])
+    git(["config", "--global", "gc.pruneexpire", "now"])
+
+def show_help():
+    config.read()
+    user = pwd.getpwuid(os.getuid()).pw_name
+    hostname = config.hostname or socket.getfqdn()
+
+    log.write("{}: caching git proxy\n\n"
+              "This cache handles the following "
+              "repositories:\n\n".format(PROGRAM))
+
+    for remote in sorted(config.remotes):
+        log.write("    {}...\n".format(config.remotes[remote]))
+
+    log.write("\nTo configure git to use this cache, run:\n\n")
+
+    for remote in sorted(config.remotes):
+        cache_url = "{}@{}:{}/".format(user, hostname, remote)
+
+        log.write("    git config --global url.{cache_url}.insteadOf "
+                  "{remote_url}\n"
+                  "    git config --global url.{remote_url}.pushInsteadOf "
+                  "{remote_url}\n\n".format(cache_url=cache_url,
+                                            remote_url=config.remotes[remote]))
+
+class Repo(object):
+    def __init__(self, name):
+        try:
+            remote, path = name.split("/", 1)
+        except ValueError:
+            raise Error("No remote specified in '{}'.".format(name))
+
+        try:
+            self.url = config.remotes[remote] + path
+        except KeyError:
+            raise Error("Unknown remote '{}' specified in "
+                        "'{}'.".format(remote, name))
+
+        self.quoted_name = urllib.quote(name, safe="")
+        self.local_dir = os.path.join(config.repos_dir, self.quoted_name)
+
+    def update(self, gc):
+        lock_file = os.path.join(config.locks_dir, self.quoted_name)
+        locked_message = ("Another instance is updating the cache for this "
+                          "repository. Waiting...")
+
+        with lock(lock_file, locked_message, block=True):
+            log.trace("Updating cache for '{}'...".format(self.url))
+
+            if not os.path.exists(self.local_dir):
+                self.clone()
+            else:
+                self.fetch(gc)
+
+            log.trace("Cache updated.")
+
+    def clone(self):
+        git(["clone", ("--quiet" if quiet else "--progress"), "--mirror",
+             self.url, self.local_dir])
+
+    def fetch(self, gc):
+        # Set remote URL in case config file has changed.
+        git(["--git-dir", self.local_dir, "config", "remote.origin.url",
+             self.url])
+
+        # Specify "origin" rather than "--all", since the latter turns off
+        # progress reporting when stderr isn't a tty. Also disable garbage
+        # collection at this point, as "git fetch" neglects to pass "--quiet"
+        # through to "git gc".
+        git(["--git-dir", self.local_dir, "-c", "gc.auto=0",
+             "fetch", ("--quiet" if quiet else "--progress"),
+             "--prune", "--tags", "origin"])
+
+        if gc:
+            git(["--git-dir", self.local_dir, "gc", "--auto"] +
+                (["--quiet"] if quiet else []))
+
+def exec_git(args):
+    try:
+        os.execvp(args[0], args)
+    except OSError as e:
+        raise Error("Error executing '{}': {}.".format(" ".join(args), e))
+
+def git(git_args):
+    args = ["git"] + git_args
+
+    with open(os.devnull, "r+") as dev_null:
+        try:
+            proc = subprocess.Popen(args, stdin=dev_null, stdout=dev_null,
+                                    stderr=subprocess.PIPE)
+        except OSError as e:
+            raise Error("Error running '{}': {}.".format(" ".join(args), e))
+
+    pipe = proc.stderr.fileno()
+    git_filter = GitFilter()
+
+    while True:
+        readable, _, _ = select.select([pipe], [], [], log.select_timeout())
+        if readable:
+            data = os.read(pipe, 1024)
+            if data == "":
+                break
+            log.write(git_filter.filter(data))
+        else:
+            # Allow log to flush suppressed data if suppression period is over.
+            log.write("")
+
+    if proc.wait() != 0:
+        raise Error("Error running '{}'.".format(" ".join(args)))
+
+# Filters output from git. Adds a prefix to each line. Removes the summary
+# of ref changes; it's not relevant to the client and could be confusing,
+# as it shows changes to the cache rather than the client's repository:
+#
+#     From git.example.com:repo
+#        0123456..789abcd  branch1 -> branch1
+#      * [new branch]      branch2 -> branch2
+class GitFilter(object):
+    def __init__(self):
+        self.start_of_line = True
+        self.discard = False
+
+    def filter(self, data):
+        output = ""
+        for c in data:
+            if self.start_of_line:
+                self.discard = c in " F"
+                if not self.discard:
+                    output += "{}: ".format(PROGRAM)
+
+            if not self.discard:
+                output += c
+
+            self.start_of_line = c in "\n\r"
+        return output
+
+@contextlib.contextmanager
+def lock(lock_file, message, block):
+    with open(lock_file, "w") as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except IOError as e:
+            if e.errno != errno.EAGAIN:
+                raise
+
+            if block:
+                log.trace(message)
+                fcntl.flock(f, fcntl.LOCK_EX)
+            else:
+                raise Error(message)
+
+        yield
+
+def mkdir(path, mode):
+    try:
+        os.mkdir(path, mode)
+    except OSError as e:
+        if e.errno != errno.EEXIST:
+            raise
+
+class Config(object):
+    def __init__(self):
+        self.config_file = os.path.expanduser("~/{}.conf".format(PROGRAM))
+
+    def read(self):
+        parser = ConfigParser.RawConfigParser()
+        parser.add_section("cache")
+        parser.set("cache", "hostname", "")
+
+        try:
+            with open(self.config_file) as f:
+                parser.readfp(f)
+
+            self.cache_dir = os.path.expanduser(parser.get("cache", "cache"))
+            self.hostname = parser.get("cache", "hostname")
+            self.remotes = dict(parser.items("remotes"))
+        except ConfigParser.Error as e:
+            raise Error("Error in '{}': {}.".format(self.config_file, e))
+        except IOError as e:
+            raise Error("Error reading '{}': "
+                        "{}.".format(self.config_file, e.strerror))
+
+        for remote in self.remotes:
+            if "/" in remote:
+                raise Error("Error in '{}': Remote '{}' contains '/' "
+                            "character.".format(self.config_file, remote))
+
+        self.repos_dir = os.path.join(self.cache_dir, "repos")
+        self.locks_dir = os.path.join(self.cache_dir, "locks")
+
+        for d in self.cache_dir, self.repos_dir, self.locks_dir:
+            mkdir(d, 0755)
+
+    def create(self):
+        if not os.path.exists(self.config_file):
+            with open(self.config_file, "w") as f:
+                f.write("[cache]\n"
+                        "cache = ~/cache\n"
+                        "#hostname = git-cache.example.com\n"
+                        "\n"
+                        "[remotes]\n"
+                        "#example = git@git.example.com:\n")
+            log.write("Created config file '{}'.\n\n"
+                      "Please edit it and add one or more "
+                      "remotes.\n".format(self.config_file))
+
+class Log(object):
+    def __init__(self):
+        self.suppress_until = None
+        self.buffer = ""
+
+    def log(self, message):
+        self.write("{}: {}\n".format(PROGRAM, message))
+
+    def trace(self, message):
+        if not quiet:
+            self.log(message)
+
+    def write(self, data):
+        if self.suppress_until:
+            self.buffer += data
+            if time.time() > self.suppress_until:
+                sys.stderr.write(self.buffer)
+                self.buffer = ""
+                self.suppress_until = None
+        else:
+            sys.stderr.write(data)
+
+    @contextlib.contextmanager
+    def suppress(self):
+        assert self.suppress_until is None
+        self.suppress_until = time.time() + LOG_DELAY
+        try:
+            yield
+        except:
+            sys.stderr.write(self.buffer)
+            raise
+        finally:
+            self.suppress_until = None
+            self.buffer = ""
+
+    def select_timeout(self):
+        if self.suppress_until:
+            return max(self.suppress_until - time.time(), 0)
+        else:
+            return None
+
+class Error(Exception):
+    pass
+
+config = Config()
+log = Log()
+quiet = False
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
